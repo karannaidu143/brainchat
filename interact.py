@@ -31,6 +31,10 @@ cred = credentials.Certificate('brainchatKey.json')
 default_app = initialize_app(cred)
 db = firestore.client()
 doc_ref = db.collection(u'messages')
+doc_ref_persona = db.collection(u'persona')
+
+# work around code 
+doc_ref_reset= db.collection(u'reset')
 
 # li=[]
 # data stream
@@ -116,12 +120,12 @@ parser.add_argument("--model_checkpoint", type=str, default="", help="Path, url 
 parser.add_argument("--max_history", type=int, default=2, help="Number of previous utterances to keep in history")
 parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
 
-parser.add_argument("--no_sample", action='store_true', help="Set to use greedy decoding instead of sampling")
+parser.add_argument("--no_sample", action='store_true',default="store_true", help="Set to use greedy decoding instead of sampling")
 parser.add_argument("--max_length", type=int, default=20, help="Maximum length of the output utterances")
 parser.add_argument("--min_length", type=int, default=1, help="Minimum length of the output utterances")
 parser.add_argument("--seed", type=int, default=0, help="Seed")
-parser.add_argument("--temperature", type=float, default=0.7, help="Sampling softmax temperature")
-parser.add_argument("--top_k", type=int, default=0, help="Filter top-k tokens before sampling (<=0: no filtering)")
+parser.add_argument("--temperature", type=float, default=0.8, help="Sampling softmax temperature")
+parser.add_argument("--top_k", type=int, default=1, help="Filter top-k tokens before sampling (<=0: no filtering)")
 parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
 args = parser.parse_args()
 
@@ -150,14 +154,22 @@ model.to(args.device)
 add_special_tokens_(model, tokenizer)
 
 history = []
-userInfo=['my name is karan.','my age is 32.','i love sports.','my dad is a software engineer.','i go to gym everyday.','i joined a drama club recently.','my favorite TV Show is Game of Thrones.']
+# userInfo=[]
 per=[]
-for i in userInfo:
-            per.append(tokenizer.encode(i))
+# for i in userInfo:
+#             per.append(tokenizer.encode(i))
+def persona_update(text):
+    global per
+    per.append(tokenizer.encode(text))
+
+def reset():
+    global history
+    global per    
+    history=[]
+    per=[]
 
 def ml(text):
     global history
-    global userInfo
     global per
     # print(tokenizer.decode(chain(*per)))
 
@@ -167,15 +179,16 @@ def ml(text):
     #     print('Text should not be empty!')
     #     raw_text = input(">>> ")
 
-        #print(tokenizer.decode(chain(*per)))
+    print(tokenizer.decode(chain(*per)))
     history.append(tokenizer.encode(raw_text))
-    # print(tokenizer.decode(chain(*history)))
-    with torch.no_grad():
-        out_ids = sample_sequence(per, history, tokenizer, model, args)
-    history.append(out_ids)
-
+    print(tokenizer.decode(chain(*history)))
+    # with torch.no_grad():
+    out_ids = sample_sequence(per, history, tokenizer, model, args)
+    # history.append(out_ids)
+    
     history = history[-(2*args.max_history+1):]
     out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
+    print(out_text)
     createInFirebase(out_text)
     # output text should be updated to the user
 
@@ -200,14 +213,53 @@ def on_snapshot(doc_snapshot, changes, read_time):
         
         ml(text)
 
-    
-
-
     callback_done.set()
 
 
+    #Code for watching personality add on
+callback_persona_done = threading.Event()
+def on_snapshot_persona(doc_snapshot_persona, changes, read_time):
+  print("second function ")
+  li=[]
+  if doc_snapshot_persona:
+    for doc in doc_snapshot_persona:
+
+        #  print(f'Received document snapshot: {doc.to_dict()}')    
+         li.append(doc.to_dict())
+    # print(li)
+    li.sort(key=lambda x:x['timestamp'])
+    # print(li)
+    # print(li.pop()['sender'])
+    latestText=li.pop()
+    # print(latestText)
+    
+    text=latestText['text']
+    
+    print(text)
+    persona_update(text)    
+
+    callback_persona_done.set() 
+
+# to reset the datapip install sentence-transformerspip install sentence-transformers
+callback_reset_done = threading.Event()
+def on_snapshot_reset(doc_snapshot_reset, changes, read_time):
+  print("3rd function ")
+  
+  if doc_snapshot_reset:
+    reset()
+
+    
+
+    callback_reset_done.set() 
+
 # Watch the document
 doc_watch = doc_ref.on_snapshot(on_snapshot)
+
+#Watch changes in personality
+doc_watch = doc_ref_persona.on_snapshot(on_snapshot_persona)
+
+# the value is reset every time a new doc is created
+doc_watch = doc_ref_reset.on_snapshot(on_snapshot_reset)
 
 def createInFirebase(response):
     try:
