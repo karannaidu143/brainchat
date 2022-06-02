@@ -1,7 +1,4 @@
-# # Copyright (c) 2019-present, HuggingFace Inc.
-# All rights reserved.
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+
 from flask import Flask
 import datetime
 from sqlite3 import Timestamp
@@ -21,9 +18,77 @@ import warnings
 import torch
 import torch.nn.functional as F
 
-from transformers import OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, GPT2LMHeadModel, GPT2Tokenizer
+from transformers import OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, GPT2LMHeadModel, GPT2Tokenizer,BartForSequenceClassification, BartTokenizer
+from transformers import AutoTokenizer, AutoModel
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from train import SPECIAL_TOKENS, build_input_from_segments, add_special_tokens_
 from utils import get_dataset, download_pretrained_model
+
+
+#Mean Pooling - Take attention mask into account for correct averaging
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0] #First element of model_output contains all token embeddings
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+sentences_b = []
+image_urls = []
+def image_desc_input(url,desc):
+  global sentences_b
+  global image_urls
+  sentences_b.append(desc)
+  image_urls.append(url)
+# Sentences we want sentence embeddings for
+def image_desc_b(text):
+    global sentences_b
+    global image_urls
+    print(sentences_b,image_urls)
+    # query = "me making food for my son"
+    query = text
+    sentences_b.insert(0,query)
+
+    # Load model from HuggingFace Hub
+    tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
+    model = AutoModel.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
+
+    # Tokenize sentences
+    encoded_input = tokenizer(sentences_b, padding=True, truncation=True, return_tensors='pt')
+
+    # Compute token embeddings
+    with torch.no_grad():
+        sentences_output = model(**encoded_input)
+
+    # Perform pooling. In this case, max pooling.
+    sentence_embeddings = mean_pooling(sentences_output, encoded_input['attention_mask'])
+
+    # convert from PyTorch tensor to numpy array
+    sentences_mean_pooled = sentence_embeddings.detach().numpy()
+
+    # compute cosine similarity
+    similarities = cosine_similarity(
+        [sentences_mean_pooled[0]],
+        sentences_mean_pooled[1:]
+    )
+
+    list1,list2,list3 = zip(*sorted(zip(similarities[0], sentences_b[1:], image_urls),reverse=True))
+    output_per_b=list1[0]
+    output_text_b=list2[0]
+    output_url_b=list3[0]
+    print(output_per_b)
+    if (output_per_b >(0.90)):
+        print('image found sending to server')
+        createInFirebase_image(output_text_b,output_url_b)
+        return('yes')
+    else:
+        return('no')
+
+
+
+
+# if query is image query  or not
+tokenizer_a = BartTokenizer.from_pretrained('facebook/bart-large-mnli')
+model_a = BartForSequenceClassification.from_pretrained('facebook/bart-large-mnli')
 
 
 # Initialize Firestore DB
@@ -32,6 +97,9 @@ default_app = initialize_app(cred)
 db = firestore.client()
 doc_ref = db.collection(u'messages')
 doc_ref_persona = db.collection(u'persona')
+doc_ref_image= db.collection(u'image')
+
+
 
 # work around code 
 doc_ref_reset= db.collection(u'reset')
@@ -39,8 +107,28 @@ doc_ref_reset= db.collection(u'reset')
 # li=[]
 # data stream
 
+# if it is a image query or not (intent classification)
+def ml_a(question_a): 
+#  question_a = 'display about my cousin'
 
+ candidate_labels_a = ['pictures']  
+    
+    # run through model pre-trained on MNLI
+ for labels in candidate_labels_a:
+  input_ids = tokenizer_a.encode(question_a, labels, return_tensors='pt')
+  logits = model_a(input_ids)[0]
 
+  # we throw away "neutral" (dim 1) and take the probability of
+  # "entailment" (2) as the probability of the label being true 
+  entail_contradiction_logits = logits[:,[0,2]]
+  probs = entail_contradiction_logits.softmax(dim=1)
+  true_prob = probs[:,1].item() * 100
+  print(true_prob)
+  print(f'Probability that the label is true: {true_prob:0.2f}%')
+  if(int(true_prob)>80):
+      return('yes')
+  else:
+      return('no')
 
 def top_filtering(logits, top_k=0., top_p=0.9, threshold=-float('Inf'), filter_value=-float('Inf')):
     """ Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
@@ -120,13 +208,13 @@ parser.add_argument("--model_checkpoint", type=str, default="", help="Path, url 
 parser.add_argument("--max_history", type=int, default=2, help="Number of previous utterances to keep in history")
 parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
 
-parser.add_argument("--no_sample", action='store_true',default="store_true", help="Set to use greedy decoding instead of sampling")
+parser.add_argument("--no_sample", action='store_true', help="Set to use greedy decoding instead of sampling")
 parser.add_argument("--max_length", type=int, default=20, help="Maximum length of the output utterances")
 parser.add_argument("--min_length", type=int, default=1, help="Minimum length of the output utterances")
 parser.add_argument("--seed", type=int, default=0, help="Seed")
-parser.add_argument("--temperature", type=float, default=0.8, help="Sampling softmax temperature")
-parser.add_argument("--top_k", type=int, default=1, help="Filter top-k tokens before sampling (<=0: no filtering)")
-parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
+parser.add_argument("--temperature", type=float, default=0.4,help="Sampling softmax temperature")
+parser.add_argument("--top_k", type=int, default=12, help="Filter top-k tokens before sampling (<=0: no filtering)")
+parser.add_argument("--top_p", type=float, default=0.99, help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO)
@@ -154,20 +242,27 @@ model.to(args.device)
 add_special_tokens_(model, tokenizer)
 
 history = []
-# userInfo=[]
 per=[]
+# userInfo=['my name is karan','i am 40 years old','i went scuba diving last week it was super fun','i received an award yesterday for best paper presentation','my son`s birthday is on 25th july']
+# per=[]
 # for i in userInfo:
 #             per.append(tokenizer.encode(i))
 def persona_update(text):
     global per
-    per.append(tokenizer.encode(text))
+    per.append(tokenizer.encode(text+'.'))
+
 
 def reset():
     global history
     global per    
     history=[]
     per=[]
-
+    print("reset the server")
+def reset_chat():
+    global per    
+    per=[]
+    print("reseted the chat")
+    
 def ml(text):
     global history
     global per
@@ -179,12 +274,12 @@ def ml(text):
     #     print('Text should not be empty!')
     #     raw_text = input(">>> ")
 
-    print(tokenizer.decode(chain(*per)))
+    # print(tokenizer.decode(chain(*per)))
     history.append(tokenizer.encode(raw_text))
-    print(tokenizer.decode(chain(*history)))
-    # with torch.no_grad():
-    out_ids = sample_sequence(per, history, tokenizer, model, args)
-    # history.append(out_ids)
+    # print(tokenizer.decode(chain(*history)))
+    with torch.no_grad():
+      out_ids = sample_sequence(per, history, tokenizer, model, args)
+    history.append(out_ids)
     
     history = history[-(2*args.max_history+1):]
     out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
@@ -193,6 +288,7 @@ def ml(text):
     # output text should be updated to the user
 
 callback_done = threading.Event()
+
 def on_snapshot(doc_snapshot, changes, read_time):
   li=[]
   if doc_snapshot:
@@ -209,10 +305,20 @@ def on_snapshot(doc_snapshot, changes, read_time):
     text=latestText['text']
     print(sender)
     if sender!='bot@gmail.com':
-        print(text)
-        
-        ml(text)
+        # print(text)
+      
+      is_query_image=ml_a(text)
+      if(is_query_image=='yes'):
+          output=image_desc_b(text)
+          if (output=='no'):
+            #   if the accuracy of the image  is low, then pass to ml model
+              ml(text)
+          else:
+              print('workflow done')    
 
+      else:
+          ml(text)
+                
     callback_done.set()
 
 
@@ -235,7 +341,7 @@ def on_snapshot_persona(doc_snapshot_persona, changes, read_time):
     
     text=latestText['text']
     
-    print(text)
+    # print(text)
     persona_update(text)    
 
     callback_persona_done.set() 
@@ -244,13 +350,49 @@ def on_snapshot_persona(doc_snapshot_persona, changes, read_time):
 callback_reset_done = threading.Event()
 def on_snapshot_reset(doc_snapshot_reset, changes, read_time):
   print("3rd function ")
-  
+  li=[]
   if doc_snapshot_reset:
-    reset()
+    for doc in doc_snapshot_reset:
 
+        #  print(f'Received document snapshot: {doc.to_dict()}')    
+         li.append(doc.to_dict())
+    # print(li)
+    li.sort(key=lambda x:x['timestamp'])
+    # print(li)
+    # print(li.pop()['sender'])
+    latestText=li.pop()
+    # print(latestText)
     
+    text=latestText['text']  
+    print(text)
+    if(text=='clear the chat'):
+         reset_chat()     
+    else:    
+       reset()
 
     callback_reset_done.set() 
+
+def on_snapshot_image(doc_snapshot_image, changes, read_time):
+  print("3rd function ")
+  li=[]
+  if doc_snapshot_image:
+    for doc in doc_snapshot_image:
+
+        #  print(f'Received document snapshot: {doc.to_dict()}')    
+         li.append(doc.to_dict())
+    # print(li)
+    li.sort(key=lambda x:x['timestamp'])
+    # print(li)
+    # print(li.pop()['sender'])
+    latestText=li.pop()
+    # print(latestText)
+    imageUrl=latestText['imageUrl']
+    text=latestText['text']  
+    print(text)
+    image_desc_input(imageUrl,text)    
+
+    callback_reset_done.set() 
+
 
 # Watch the document
 doc_watch = doc_ref.on_snapshot(on_snapshot)
@@ -261,11 +403,27 @@ doc_watch = doc_ref_persona.on_snapshot(on_snapshot_persona)
 # the value is reset every time a new doc is created
 doc_watch = doc_ref_reset.on_snapshot(on_snapshot_reset)
 
+# watch if imageurll and text is updated
+doc_watch = doc_ref_image.on_snapshot(on_snapshot_image)
 def createInFirebase(response):
     try:
         doc_ref.document().set({
           "sender": "bot@gmail.com",
           "text": response,
+          "image":'',
+          "timestamp": firebase_admin.firestore.SERVER_TIMESTAMP
+
+      })
+        print('created')
+
+    except Exception as e:
+        print(f'An Error Occured: {e}')
+def createInFirebase_image(response,url):
+    try:
+        doc_ref.document().set({
+          "sender": "bot@gmail.com",
+          "text": response,
+          "image":url,
           "timestamp": firebase_admin.firestore.SERVER_TIMESTAMP
       })
         print('created')
